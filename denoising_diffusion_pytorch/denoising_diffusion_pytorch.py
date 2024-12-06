@@ -5,14 +5,20 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
-
+import matplotlib.pyplot as plt
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
-
+import numpy as np
+from torchaudio.functional import biquad
+from scipy.ndimage import gaussian_filter
+from scipy.signal import butter
+import matplotlib.pyplot as plt
+import deepwave
+from deepwave import scalar
 from torch.optim import Adam
 
 from torchvision import transforms as T, utils
@@ -32,6 +38,60 @@ from denoising_diffusion_pytorch.attend import Attend
 
 from denoising_diffusion_pytorch.version import __version__
 
+device = torch.device('cuda' if torch.cuda.is_available()
+                      else 'cpu')
+n_shots = 10
+ny = 100
+nx = 100
+n_sources_per_shot = 1
+d_source = 10  # 20 * 4m = 80m
+first_source = 0.  # 10 * 4m = 40m
+source_depth = 0.5  # 2 * 4m = 8m
+
+n_receivers_per_shot = 100
+d_receiver = 1  # 6 * 4m = 24m
+first_receiver = 0  # 0 * 4m = 0m
+receiver_depth = 0  # 2 * 4m = 8m
+
+freq = 25
+nt = 200
+dt = 0.004
+peak_time = 1.5 / freq
+
+dx = 4
+
+observed_data = (
+    torch.from_file('/work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/marmousi_data.bin',
+                    size=n_shots*n_receivers_per_shot*nt)
+    .reshape(n_shots, n_receivers_per_shot, nt)
+)
+
+observed_data = (
+    observed_data[:n_shots, :n_receivers_per_shot, :nt].to(device)
+)
+
+# source_locations
+source_locations = torch.zeros(n_shots, n_sources_per_shot, 2,
+                               dtype=torch.long, device=device)
+source_locations[..., 1] = source_depth
+source_locations[:, 0, 0] = (torch.arange(n_shots) * d_source +
+                             first_source)
+
+# receiver_locations
+receiver_locations = torch.zeros(n_shots, n_receivers_per_shot, 2,
+                                 dtype=torch.long, device=device)
+receiver_locations[..., 1] = receiver_depth
+receiver_locations[:, :, 0] = (
+    (torch.arange(n_receivers_per_shot) * d_receiver +
+     first_receiver)
+    .repeat(n_shots, 1)
+)
+
+# source_amplitudes
+source_amplitudes = (
+    (deepwave.wavelets.ricker(freq, nt, dt, peak_time))
+    .repeat(n_shots, n_sources_per_shot, 1).to(device)
+)
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
@@ -99,6 +159,9 @@ def Downsample(dim, dim_out = None):
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
     )
+def reverse_linear_transform(normalized_data):
+    data = (normalized_data + 1.0) / 2.0 * (4500.0 - 1500.0093994140625) + 1500.0093994140625
+    return data
 
 class RMSNorm(Module):
     def __init__(self, dim):
@@ -487,18 +550,19 @@ class GaussianDiffusion(Module):
         beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
-        auto_normalize = True,
+        auto_normalize = False,
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        immiscible = False
+        immiscible = False,
+        is_working_with_fwi = True
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
         assert not hasattr(model, 'random_or_learned_sinusoidal_cond') or not model.random_or_learned_sinusoidal_cond
 
         self.model = model
-
+        self.is_working_with_fwi = is_working_with_fwi
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
 
@@ -698,49 +762,124 @@ class GaussianDiffusion(Module):
         ret = self.unnormalize(ret)
         return ret
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def ddim_sample(self, shape, return_all_timesteps = False):
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+        is_working_with_fwi = self.is_working_with_fwi
+        if not is_working_with_fwi:
+            batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
-        times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+            times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+            times = list(reversed(times.int().tolist()))
+            time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        img = torch.randn(shape, device = device)
-        imgs = [img]
+            img = torch.randn(shape, device = device)
+            imgs = [img]
 
-        x_start = None
+            x_start = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-            self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+                time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
+                self_cond = x_start if self.self_condition else None
+                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
 
-            if time_next < 0:
-                img = x_start
+                if time_next < 0:
+                    img = x_start
+                    imgs.append(img)
+                    continue
+
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
+
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                noise = torch.randn_like(img)
+
+                img = x_start * alpha_next.sqrt() + \
+                    c * pred_noise + \
+                    sigma * noise
+
                 imgs.append(img)
-                continue
 
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
+            ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
+            ret = self.unnormalize(ret)
+            return ret
+        
+        else:
+            batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
-            noise = torch.randn_like(img)
+            times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+            times = list(reversed(times.int().tolist()))
+            time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            img = torch.randn(shape, device = device)
+            imgs = [img]
 
-            imgs.append(img)
+            x_start = None
+            loss_rescared = 0
+            
+            for time, time_next in tqdm(time_pairs, desc = f'sampling loop time step L{loss_rescared}'):
+                time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
+                self_cond = x_start if self.self_condition else None
+                
+                img = img.clone().detach().requires_grad_(True)
+                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+                
+                x_start_rescared = reverse_linear_transform(x_start)
+                
+                
+                out = scalar(
+                x_start_rescared.squeeze(0).squeeze(0).T, dx, dt,
+                source_amplitudes=source_amplitudes,
+                source_locations=source_locations,
+                receiver_locations=receiver_locations,
+                pml_freq=freq,
+                )
+                
+                loss_fn = torch.nn.MSELoss()
+                loss = loss_fn(out[-1], observed_data)
+                loss_rescared = loss #observed_data.shape[0] * observed_data.shape[1]
+                #loss_rescared.backward()
+                grad_img = torch.autograd.grad(loss_rescared, img)[0]
+                loss_value = loss_rescared.detach().item()
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
+                print(time)
+                # Change the learning rate here
+                if time < 1000:
+                    rate =  (25) * 1e0 * 5 *0
+                else:
+                    rate = 0
+                tqdm.write(f'Loss: {loss_value}')
+                if np.mod(time, 50) == 0: print(rate)
+                grad_img = - rate * grad_img
+                if time_next < 0:
+                    img = x_start
+                    imgs.append(img)
+                    continue
+                
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
 
-        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
 
-        ret = self.unnormalize(ret)
-        return ret
+                noise = torch.randn_like(img)
+                # 
+                img = x_start * alpha_next.sqrt() + \
+                    c * (pred_noise - (1 /(1 - alpha).sqrt()) * grad_img) + \
+                    sigma * noise + \
+                    alpha_next.sqrt() / alpha.sqrt() * grad_img
+                    
 
-    @torch.inference_mode()
+                imgs.append(img)
+
+            ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+            ret = self.unnormalize(ret)
+            return ret
+
+    # @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
@@ -841,7 +980,24 @@ class GaussianDiffusion(Module):
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
+class Dataset_tensor(Dataset):
+    def __init__(
+        self,
+        folder,
+        image_size,
+        augment_horizontal_flip = False,
+    ):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.data = torch.load(folder)
+        
+    def __len__(self):
+        return self.data.shape[0]
 
+    def __getitem__(self, index):
+        return self.data[index,...]
+        
 class Dataset(Dataset):
     def __init__(
         self,
@@ -892,7 +1048,7 @@ class Trainer:
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 1000,
         num_samples = 25,
-        results_folder = './results',
+        results_folder = '/work/10225/bowenshi0610/vista/denoising-diffusion-pytorch/results2',
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
@@ -900,7 +1056,7 @@ class Trainer:
         calculate_fid = True,
         inception_block_idx = 2048,
         max_grad_norm = 1.,
-        num_fid_samples = 50000,
+        num_fid_samples = 40000,
         save_best_and_latest_only = False
     ):
         super().__init__()
@@ -940,10 +1096,10 @@ class Trainer:
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-
+        # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = Dataset_tensor(folder, self.image_size)
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
-
+        print(f"the length of the dataset is {len(self.ds)}")
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
         dl = self.accelerator.prepare(dl)
@@ -1080,19 +1236,25 @@ class Trainer:
 
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
+                            batches = num_to_groups(49, 32)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim = 0)
 
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
 
+                        plt.figure(figsize=(40, 40))
+                        for ii in range(49):
+                            plt.subplot(7,7,ii+1)
+                            plt.imshow(all_images[ii,0,:,:].cpu().numpy())
+                        plt.savefig(str(self.results_folder / f'sample-{milestone}.png') ,dpi=300)
                         # whether to calculate fid
 
                         if self.calculate_fid:
                             fid_score = self.fid_scorer.fid_score()
                             accelerator.print(f'fid_score: {fid_score}')
-
+ 
+                        
                         if self.save_best_and_latest_only:
                             if self.best_fid > fid_score:
                                 self.best_fid = fid_score
