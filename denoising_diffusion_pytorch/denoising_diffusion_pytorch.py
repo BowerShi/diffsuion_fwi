@@ -159,9 +159,14 @@ def Downsample(dim, dim_out = None):
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
     )
+    
 def reverse_linear_transform(normalized_data):
     data = (normalized_data + 1.0) / 2.0 * (4500.0 - 1500.0093994140625) + 1500.0093994140625
     return data
+
+def linear_transform(data):
+    normalized_data = 2 * (data - 1500.0093994140625) / (4500.0 - 1500.0093994140625) - 1
+    return normalized_data
 
 class RMSNorm(Module):
     def __init__(self, dim):
@@ -555,7 +560,7 @@ class GaussianDiffusion(Module):
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
         immiscible = False,
-        is_working_with_fwi = True
+        is_working_with_fwi = 0
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -763,9 +768,9 @@ class GaussianDiffusion(Module):
         return ret
 
     # @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
+    def ddim_sample(self, shape, return_all_timesteps = True):
         is_working_with_fwi = self.is_working_with_fwi
-        if not is_working_with_fwi:
+        if is_working_with_fwi == 0:
             batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
             times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -774,7 +779,7 @@ class GaussianDiffusion(Module):
 
             img = torch.randn(shape, device = device)
             imgs = [img]
-
+            imgs = []
             x_start = None
 
             for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
@@ -799,14 +804,14 @@ class GaussianDiffusion(Module):
                     c * pred_noise + \
                     sigma * noise
 
-                imgs.append(img)
+                imgs.append(x_start)
 
             ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
             ret = self.unnormalize(ret)
             return ret
         
-        else:
+        elif is_working_with_fwi == 1:
             batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
             times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -874,13 +879,141 @@ class GaussianDiffusion(Module):
                     
 
                 imgs.append(img)
-
+            
             ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
             ret = self.unnormalize(ret)
             return ret
+        
+        elif is_working_with_fwi == 2:
+            batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+            times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+            times = list(reversed(times.int().tolist()))
+            time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+            img = torch.randn(shape, device = device)
+            imgs = []
+
+            x_start = None
+            loss_rescared = 0
+            
+            for time, time_next in tqdm(time_pairs, desc = f'sampling loop time step L{loss_rescared}'):
+                time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
+                self_cond = x_start if self.self_condition else None
+                
+                #img = img.clone().detach().requires_grad_(True)
+                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+                x_start = x_start.clone().detach().requires_grad_(True)
+                rate = (25) * 1e1
+                for i in range(5):
+                    x_start_rescared = reverse_linear_transform(x_start)
+                    
+                    out = scalar(
+                    x_start_rescared.squeeze(0).squeeze(0).T, dx, dt,
+                    source_amplitudes=source_amplitudes,
+                    source_locations=source_locations,
+                    receiver_locations=receiver_locations,
+                    pml_freq=freq,
+                    )
+                    
+                    loss_fn = torch.nn.MSELoss()
+                    loss = loss_fn(out[-1], observed_data)
+                    loss_rescared = loss #observed_data.shape[0] * observed_data.shape[1]
+                    #loss_rescared.backward()
+                    grad_img = torch.autograd.grad(loss_rescared, x_start)[0]
+                    
+                    loss_value = loss_rescared.detach().item()
+                    alpha = self.alphas_cumprod[time]
+                    alpha_next = self.alphas_cumprod[time_next]
+                    # Change the learning rate here
+                    if time < 1000:
+                        rate =  rate * 1.
+                    else:
+                        rate = 0
+                    tqdm.write(f'Loss: {loss_value}')
+                    if np.mod(time, 50) == 0: print(rate)
+                    x_start = x_start - rate * grad_img 
+                    x_start = x_start.clone().detach().requires_grad_(True)
+                if time_next < 0:
+                    img = x_start
+                    imgs.append(img)
+                    continue
+                
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
+
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                noise = torch.randn_like(img)
+                # 
+                img = x_start * alpha_next.sqrt() + \
+                    c * (pred_noise ) + \
+                    sigma * noise
+                    
+
+                imgs.append(x_start)
+            
+            ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+            ret = self.unnormalize(ret)
+            return ret
+        elif is_working_with_fwi == 3:
+            batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+            times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+            times = list(reversed(times.int().tolist()))
+            time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+            # img = torch.randn(shape, device = device)
+            img = torch.load('/work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/inverted_multi.pt')
+            img = linear_transform(img.T).unsqueeze(0).unsqueeze(0)
+            imgs = []
+
+            x_start = None
+            indicator = 0
+            loss_rescared = 0
+            
+            for time, time_next in tqdm(time_pairs, desc = f'sampling loop time step L{loss_rescared}'):
+                if time > 200:
+                    continue
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
+                indicator = indicator + 1
+                if indicator == 1:
+                    img = alpha.sqrt() * img + (1 - alpha).sqrt() * torch.rand_like(img)
+                time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
+                self_cond = x_start if self.self_condition else None
+                
+                #img = img.clone().detach().requires_grad_(True)
+                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+
+                
+                if time_next < 0:
+                    img = x_start
+                    imgs.append(img)
+                    continue
+                
+
+
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                noise = torch.randn_like(img)
+                # 
+                img = x_start * alpha_next.sqrt() + \
+                    c * (pred_noise ) + \
+                    sigma * noise
+                    
+
+                # imgs.append(x_start)
+                imgs.append(img)
+            ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+            ret = self.unnormalize(ret)
+            return ret
+            
 
     # @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, batch_size = 16, return_all_timesteps = True):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
