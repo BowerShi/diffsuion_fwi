@@ -30,7 +30,7 @@ diffusion = GaussianDiffusion(
     model,
     image_size = 100,
     timesteps = 1000,           # number of steps
-    sampling_timesteps = 250,   # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+    sampling_timesteps = 100,   # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
     auto_normalize = False,
     is_working_with_fwi = 2 # True for conditional generation
 )
@@ -85,6 +85,6 @@ frames[0].save(
     'animated.gif', 
     save_all=True, 
     append_images=frames[1:], 
-    duration=0.001,  # Duration per frame in milliseconds
+    duration=0.01,  # Duration per frame in milliseconds
     loop=0  # 0 = infinite loop
 )

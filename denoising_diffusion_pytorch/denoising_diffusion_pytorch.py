@@ -781,6 +781,7 @@ class GaussianDiffusion(Module):
             imgs = [img]
             imgs = []
             x_start = None
+            print('I am here')
 
             for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
                 time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
@@ -804,8 +805,9 @@ class GaussianDiffusion(Module):
                     c * pred_noise + \
                     sigma * noise
 
+                # imgs.append(x_start)
                 imgs.append(x_start)
-
+                
             ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
             ret = self.unnormalize(ret)
@@ -852,8 +854,8 @@ class GaussianDiffusion(Module):
                 alpha_next = self.alphas_cumprod[time_next]
                 print(time)
                 # Change the learning rate here
-                if time < 1000:
-                    rate =  (25) * 1e0 * 5 *0
+                if time > 500:
+                    rate =  (25) * 1e-1 * 5 
                 else:
                     rate = 0
                 tqdm.write(f'Loss: {loss_value}')
@@ -878,7 +880,7 @@ class GaussianDiffusion(Module):
                     alpha_next.sqrt() / alpha.sqrt() * grad_img
                     
 
-                imgs.append(img)
+                imgs.append(x_start)
             
             ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
             ret = self.unnormalize(ret)
@@ -957,6 +959,7 @@ class GaussianDiffusion(Module):
             ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
             ret = self.unnormalize(ret)
             return ret
+        
         elif is_working_with_fwi == 3:
             batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
@@ -965,7 +968,7 @@ class GaussianDiffusion(Module):
             time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
             # img = torch.randn(shape, device = device)
-            img = torch.load('/work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/inverted_multi.pt')
+            img = torch.load('/work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/inverted.pt')
             img = linear_transform(img.T).unsqueeze(0).unsqueeze(0)
             imgs = []
 
@@ -994,7 +997,6 @@ class GaussianDiffusion(Module):
                     continue
                 
 
-
                 sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
                 c = (1 - alpha_next - sigma ** 2).sqrt()
 
@@ -1002,8 +1004,7 @@ class GaussianDiffusion(Module):
                 # 
                 img = x_start * alpha_next.sqrt() + \
                     c * (pred_noise ) + \
-                    sigma * noise
-                    
+                    sigma * noise          
 
                 # imgs.append(x_start)
                 imgs.append(img)
