@@ -32,7 +32,8 @@ diffusion = GaussianDiffusion(
     timesteps = 1000,           # number of steps
     sampling_timesteps = 250,   # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
     auto_normalize = False,
-    is_working_with_fwi = 2 # True for conditional generation
+    is_working_with_fwi = 4
+    # True for conditional generation
 )
 # result_folder should be the address where you store model-300.pt
 # folder should be the address where you store normalized_fwi.pt (normalized to [-1, 1]) via linear transform
@@ -52,10 +53,13 @@ all_images = torch.cat(all_images_list, dim = 0)
 print(all_images.shape)
 all_images = all_images.squeeze(0).squeeze(1).detach().cpu().numpy()
 
-plt.figure(figsize=(5, 5))
-for ii in range(1):
-	plt.subplot(1,1,ii+1)
-	plt.imshow(all_images[ii, :, :])
+num_of_pics = 9
+plt.figure(figsize=(20, 20))
+plt.title(f"Last {num_of_pics} pictures of predicted x_start")
+for ii in range(num_of_pics):
+	plt.subplot(int(np.sqrt(num_of_pics)), int(np.sqrt(num_of_pics)), ii+1)
+	plt.imshow(all_images[all_images.shape[0]-1-ii, :, :])
+
 plt.savefig('/work/10225/bowenshi0610/vista/denoising-diffusion-pytorch/preview3.png',dpi=100)
 
 # 	plt.colorbar(orientation='horizontal',shrink=0.6,label='Vel');
