@@ -1,0 +1,21 @@
+n_shots: 10
+ny: 100
+nx: 100
+n_sources_per_shot: 1
+d_source: 10
+first_source: 0.0
+source_depth: 0.5
+n_receivers_per_shot: 100
+d_receiver: 1
+first_receiver: 0
+receiver_depth: 0
+freq: 25
+nt: 200
+dt: 0.004
+peak_time: 0.06
+dx: 4
+index: 48643 # on which velocity image we do FWI. salt body - 39363
+
+result_folder_path: /work/10225/bowenshi0610/vista/results2 # where the model is stored
+dataset_path: /work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/geofwi.npy # where original data is stored ~50k
+training_data_path: /work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/normalized_fwi.pt # where processed training data is stored ~45k

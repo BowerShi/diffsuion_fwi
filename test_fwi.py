@@ -6,7 +6,6 @@ from deepwave import scalar
 import numpy as np
 device = torch.device('cuda' if torch.cuda.is_available()
                       else 'cpu')
-import torch
 from torchaudio.functional import biquad
 from scipy.ndimage import gaussian_filter
 from scipy.signal import butter
@@ -219,7 +218,30 @@ frames[0].save(
     loop=0  # 0 = infinite loop
 )
 ## Second attempt: constrained velocity and frequency filtering
-'''
+
+def taper(x):
+    return deepwave.common.cosine_taper_end(x, 100)
+
+
+# Generate a velocity model constrained to be within a desired range
+class Model(torch.nn.Module):
+    def __init__(self, initial, min_vel, max_vel):
+        super().__init__()
+        self.min_vel = min_vel
+        self.max_vel = max_vel
+        self.model = torch.nn.Parameter(
+            torch.logit((initial - min_vel) /
+                        (max_vel - min_vel))
+        )
+
+    def forward(self):
+        return (torch.sigmoid(self.model) *
+                (self.max_vel - self.min_vel) +
+                self.min_vel)
+
+
+observed_data = taper(observed_data)
+model = Model(v_init, 1000, 4500).to(device)
 
 
 # Define a function to taper the ends of traces
@@ -229,42 +251,34 @@ frames[0].save(
 n_epochs = 200
 all_images = []
 for cutoff_freq in [10, 15, 20, 25, 30]:
+    sos = butter(6, cutoff_freq, fs=1/dt, output='sos')
+    sos = [torch.tensor(sosi).to(observed_data.dtype).to(device)
+           for sosi in sos]
 
-
-    optimiser = torch.optim.SGD(model.parameters(), lr=1e9, momentum=0.9)
-    
+    def filt(x):
+        return biquad(biquad(biquad(x, *sos[0]), *sos[1]), *sos[2])
+    observed_data_filt = filt(observed_data)
+    optimiser = torch.optim.LBFGS(model.parameters(),
+                                  line_search_fn='strong_wolfe')
     for epoch in range(n_epochs):
-        print(f"{cutoff_freq, epoch}")
-        optimiser.zero_grad()
-            
-                
-        
-        if epoch !=0 and epoch % 10 == 0:
-                torch.save(v, '/work/10225/bowenshi0610/vista/fwi_dataset/GeoFWI/inverted.pt')
-                all_images_list = list(map(lambda n: trainer.ema.ema_model.sample(batch_size=n), batches))
-                v_temp = 0.5 * v + 0.5 * reverse_linear_transform(torch.cat(all_images_list, dim = 0).squeeze(0).squeeze(0).T)
-            
-        out = scalar(
-            v_temp if epoch !=0 and epoch % 50 == 0 else v, dx, dt,
-            source_amplitudes=source_amplitudes,
-            source_locations=source_locations,
-            receiver_locations=receiver_locations,
-            max_vel=4500,
-            pml_freq=freq,
-            time_pad_frac=0.2,
+        def closure():
+            optimiser.zero_grad()
+            v = model()
+            out = scalar(
+                v, dx, dt,
+                source_amplitudes=source_amplitudes,
+                source_locations=source_locations,
+                receiver_locations=receiver_locations,
+                max_vel=2500,
+                pml_freq=freq,
+                time_pad_frac=0.2,
             )
-        out_filt = filt(taper(out[-1]))
-        loss = loss_fn(out_filt, observed_data_filt)
-        loss.backward()
-        
-        torch.nn.utils.clip_grad_value_(
-        v,
-        torch.quantile(v.grad.detach().abs(), 0.98)
-    )
-        print(loss.detach().cpu().numpy())
-        if epoch !=0 and epoch % 50 == 0:
-            all_images.append(reverse_linear_transform(torch.cat(all_images_list, dim = 0).squeeze(0).squeeze(0).T).detach().cpu().numpy())
-        optimiser.step()
+            out_filt = filt(taper(out[-1]))
+            loss = 1e6*loss_fn(out_filt, observed_data_filt)
+            loss.backward()
+            return loss
+
+        optimiser.step(closure)
         
         
 v = model()
@@ -312,4 +326,3 @@ frames[0].save(
     loop=0  # 0 = infinite loop
 )
 ## Second attempt: constrained velocity and frequency filtering
-'''
